@@ -1,0 +1,33 @@
+# Fast lock check for the fork branch. The full nix build in cachix-fork.yml
+# would also catch a stale lock (wrong hash = failed build), but that takes
+# tens of minutes; this fails in seconds on pure local comparison.
+name: Grammar Lock
+
+on:
+  push:
+    branches:
+      - release_fork
+    paths:
+      - languages.toml
+      - grammars.lock.json
+      - update-grammars.py
+  pull_request:
+    paths:
+      - languages.toml
+      - grammars.lock.json
+      - update-grammars.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lock up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Check grammars.lock.json is up to date
+        run: python3 update-grammars.py --check

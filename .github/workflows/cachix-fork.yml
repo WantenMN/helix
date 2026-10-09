@@ -1,0 +1,50 @@
+# Publish fork builds to your own Cachix cache.
+# Upstream .github/workflows/cachix.yml pushes master -> helix cache.
+# This one pushes release_fork -> wanten cache, so nixos
+# `nix flake update helix` can hit the binary cache directly.
+name: Cachix Fork
+
+on:
+  push:
+    branches:
+      - release_fork
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish Fork Flake
+    if: github.repository == 'WantenMN/helix'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Authenticate with Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: wanten
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # No daemon push: we push the exact runtime closure below.
+          # Daemon mode races job end (final artifact missed) and also
+          # pushes build-time-only deps, wasting cache storage.
+          skipPush: true
+          useDaemon: false
+
+      - name: Build and push runtime closure
+        # pipefail: without it a failing `nix build` is masked by `cachix push`
+        # reading empty stdin ("Nothing to push") and the job stays green.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: nix build -L --no-link --print-out-paths .#default | cachix push wanten
+
+      - name: Pin release in Cachix
+        # Pinned paths are immune to LRU garbage collection; keep the last 5.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          out=$(nix build --no-link --print-out-paths .#default)
+          cachix pin wanten helix-release_fork "$out" --keep-revisions 5
