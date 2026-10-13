@@ -40,10 +40,13 @@ in
   rustPlatform.buildRustPackage (self: {
     cargoLock = {
       lockFile = ./Cargo.lock;
-      # This is not allowed in nixpkgs but is very convenient here: it allows us to
-      # avoid specifying `outputHashes` here for any git dependencies we might take
-      # on temporarily.
-      allowBuiltinFetchGit = true;
+      # Pinned fixed-output hashes for cargo git dependencies, so builds are
+      # reproducible and substitutable (no builtin fetchGit network access).
+      # If a new git dependency is added, the build fails loudly here until
+      # its hash is pinned as well.
+      outputHashes = {
+        "filesentry-0.2.2" = "sha256-ts77PMGUJVfw5BqUZLIk2iKchkCiNGikuSkuxjIJB3s=";
+      };
     };
 
     propagatedBuildInputs = [ runtimeDir ];
