@@ -1,0 +1,222 @@
+# Fork rolling tarball (traditional Linux packaging, no Nix).
+#
+# Push to release_fork -> cargo build --profile opt on ubuntu-24.04, assemble
+# the FHS payload (bin/hx + share/helix/runtime + completions/desktop), pack
+# helix-linux-x86_64.tar.gz, force-move rolling tag `fork-linux-x86_64`,
+# upload, fill version/hash into dist/nix/helix-fork.nix, upload that too,
+# then verify with a real `nix build` of the uploaded URL.
+#
+# Tree-sitter grammar .so files are intentionally NOT bundled (same as
+# upstream release.yml): users build them with `hx --grammar fetch/build`.
+# dotfiles consumes this via pkgs/update-fork-tarballs.sh. Replaces cachix.
+name: Fork Tarball
+
+on:
+  push:
+    branches:
+      - release_fork
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  # Fixed-name pointer consumed by dotfiles (overwritten every run).
+  NIX_ASSET: helix-fork.nix
+  # Versioned names (accumulate on the release, pruned to newest 10) are
+  # composed in the version step below.
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+  KEEP_VERSIONS: "10"
+
+jobs:
+  tarball:
+    name: Build, publish and verify tarball
+    if: github.repository == 'WantenMN/helix'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        with:
+          key: fork-tarball-cargo
+
+      - name: Compute rolling version
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          ver_date=$(date -u +%Y.%m.%d)
+          upstream=$(grep -oP '^version\s*=\s*"\K[^"]+' Cargo.toml | head -n 1)
+          roll_version="${upstream}-${ver_date}-g${short_sha}"
+          echo "roll_version=${roll_version}" >> "$GITHUB_ENV"
+          # Versioned asset names accumulate on the rolling release (old
+          # versions are retained, pruned to newest $KEEP_VERSIONS at the end).
+          echo "TARBALL=helix-${roll_version}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+          echo "NIX_VERSIONED=helix-fork-${roll_version}.nix" >> "$GITHUB_ENV"
+
+      - name: Build release binary (+ grammars)
+        # Grammars MUST be bundled: users never fetch locally. helix-term's
+        # build.rs clones grammar sources (languages.toml) and compiles them
+        # into runtime/grammars/*.so in the source tree, which the assemble
+        # step below ships (only `sources/` is dropped). needs_recompile()
+        # makes retries cheap (already-built grammars are skipped), so retry
+        # the whole build against transient grammar-git failures.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          # Baked-in fallback so a plain /usr install works with no env vars;
+          # the nix drv overrides it via HELIX_RUNTIME anyway.
+          HELIX_DEFAULT_RUNTIME: /usr/share/helix/runtime
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --locked --profile opt; then
+              break
+            fi
+            echo "cargo build attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "bundled grammar objects: $(ls target/opt/build 2>/dev/null | wc -l) build dirs"
+          echo "grammars compiled: $(ls runtime/grammars/*.so 2>/dev/null | wc -l)"
+
+      - name: Assemble FHS stage and pack tarball
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf stage
+          mkdir -p stage/bin stage/share/helix \
+            stage/share/applications stage/share/icons/hicolor/256x256/apps \
+            stage/share/bash-completion/completions \
+            stage/share/fish/vendor_completions.d \
+            stage/share/zsh/site-functions
+          install -Dm755 target/opt/hx stage/bin/hx
+          # Runtime without grammar sources (same as upstream release.yml).
+          # Ship the compiled grammar objects, drop only the git sources
+          # (same split as upstream release.yml). No local `hx --grammar
+          # fetch/build` is ever needed: the .so files travel with the
+          # tarball and are found via HELIX_RUNTIME.
+          so_count=$(ls runtime/grammars/*.so 2>/dev/null | wc -l)
+          echo "shipping $so_count grammar objects"
+          [ "$so_count" -gt 50 ]
+          rm -rf runtime/grammars/sources
+          cp -r runtime stage/share/helix/runtime
+          install -Dm644 contrib/Helix.desktop stage/share/applications/Helix.desktop
+          install -Dm644 contrib/helix.png stage/share/icons/hicolor/256x256/apps/helix.png
+          install -Dm644 contrib/completion/hx.bash stage/share/bash-completion/completions/hx
+          install -Dm644 contrib/completion/hx.fish stage/share/fish/vendor_completions.d/hx.fish
+          install -Dm644 contrib/completion/hx.zsh stage/share/zsh/site-functions/_hx
+          printf 'version=%s\ncommit=%s\n' "$roll_version" "$GITHUB_SHA" > stage/BUILD-INFO.txt
+          tar -czf "$TARBALL" -C stage .
+          ls -lh "$TARBALL"
+
+      - name: Smoke test staged payload
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf /tmp/hx-smoke
+          mkdir -p /tmp/hx-smoke
+          tar -xzf "$TARBALL" -C /tmp/hx-smoke
+          HELIX_RUNTIME=/tmp/hx-smoke/share/helix/runtime /tmp/hx-smoke/bin/hx --version
+          HELIX_RUNTIME=/tmp/hx-smoke/share/helix/runtime /tmp/hx-smoke/bin/hx --health
+
+      - name: Install nix (verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Publish tarball to versioned release
+        # One release per version (never overwritten): old versions stay
+        # downloadable for stale machines. Re-runs of the same commit reuse
+        # the same tag (idempotent create + clobber upload).
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver_tag="fork-${roll_version}"
+          echo "ver_tag=${ver_tag}" >> "$GITHUB_ENV"
+          git tag -f "$ver_tag"
+          git push -f origin "$ver_tag"
+          if ! gh release view "$ver_tag" >/dev/null 2>&1; then
+            gh release create "$ver_tag" \
+              --title "Helix fork ${roll_version}" \
+              --notes "Prebuilt helix ${roll_version} from release_fork (${GITHUB_SHA})." \
+              --target release_fork
+          fi
+          gh release upload "$ver_tag" "$TARBALL" --clobber
+
+      - name: Generate + publish verified .nix and verify nix build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="https://github.com/WantenMN/helix/releases/download/${ver_tag}/${TARBALL}"
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${roll_version}\";|" \
+            -e "s|url = \".*\";|url = \"${url}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          # Versioned asset (retained on its own release) + fixed-name pointer
+          # (rolling tag, dotfiles target).
+          cp "dist/nix/${NIX_ASSET}" "dist/nix/${NIX_VERSIONED}"
+          gh release upload "$ver_tag" "dist/nix/${NIX_VERSIONED}" --clobber
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Helix fork rolling pointers" \
+              --notes "Fixed-name .nix pointers to the newest versioned releases. Each version has its own release; old versions are retained (newest 10)." \
+              --target release_fork
+          fi
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          "$out/bin/hx" --version
+          "$out/bin/hx" --health
+
+      - name: Prune old versioned releases (keep newest)
+        # Old versions are separate releases so stale machines can reinstall
+        # the exact version their dotfiles pin; only releases beyond the
+        # newest $KEEP_VERSIONS are deleted (release + tag). The rolling
+        # pointer release is never touched.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tags=$(gh release list --limit 100 --json tagName,createdAt \
+            --jq -r 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E '^fork-' | grep -v -x "$ROLL_TAG" || true)
+          count=$(echo "$tags" | grep -c . || true)
+          count=${count:-0}
+          if [ "$count" -gt "$KEEP_VERSIONS" ]; then
+            echo "$tags" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              echo "pruning old versioned release: $t"
+              gh release delete "$t" --cleanup-tag -y
+            done
+          else
+            echo "keeping all $count versioned release(s)"
+          fi
