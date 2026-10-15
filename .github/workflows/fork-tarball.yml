@@ -1,0 +1,147 @@
+# Fork rolling tarball (traditional Linux packaging, no Nix).
+#
+# Push to release_fork -> cargo build --profile opt on ubuntu-24.04, assemble
+# the FHS payload (bin/hx + share/helix/runtime + completions/desktop), pack
+# helix-linux-x86_64.tar.gz, force-move rolling tag `fork-linux-x86_64`,
+# upload, fill version/hash into dist/nix/helix-fork.nix, upload that too,
+# then verify with a real `nix build` of the uploaded URL.
+#
+# Tree-sitter grammar .so files are intentionally NOT bundled (same as
+# upstream release.yml): users build them with `hx --grammar fetch/build`.
+# dotfiles consumes this via pkgs/update-fork-tarballs.sh. Replaces cachix.
+name: Fork Tarball
+
+on:
+  push:
+    branches:
+      - release_fork
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  TARBALL: helix-linux-x86_64.tar.gz
+  NIX_ASSET: helix-fork.nix
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+
+jobs:
+  tarball:
+    name: Build, publish and verify tarball
+    if: github.repository == 'WantenMN/helix'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        with:
+          key: fork-tarball-cargo
+
+      - name: Compute rolling version
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          ver_date=$(date -u +%Y.%m.%d)
+          upstream=$(grep -oP '^version\s*=\s*"\K[^"]+' Cargo.toml | head -n 1)
+          echo "roll_version=${upstream}-${ver_date}-g${short_sha}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          # Baked-in fallback so a plain /usr install works with no env vars;
+          # the nix drv overrides it via HELIX_RUNTIME anyway.
+          HELIX_DEFAULT_RUNTIME: /usr/share/helix/runtime
+        run: cargo build --locked --profile opt
+
+      - name: Assemble FHS stage and pack tarball
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf stage
+          mkdir -p stage/bin stage/share/helix \
+            stage/share/applications stage/share/icons/hicolor/256x256/apps \
+            stage/share/bash-completion/completions \
+            stage/share/fish/vendor_completions.d \
+            stage/share/zsh/site-functions
+          install -Dm755 target/opt/hx stage/bin/hx
+          # Runtime without grammar sources (same as upstream release.yml).
+          rm -rf runtime/grammars/sources
+          cp -r runtime stage/share/helix/runtime
+          install -Dm644 contrib/Helix.desktop stage/share/applications/Helix.desktop
+          install -Dm644 contrib/helix.png stage/share/icons/hicolor/256x256/apps/helix.png
+          install -Dm644 contrib/completion/hx.bash stage/share/bash-completion/completions/hx
+          install -Dm644 contrib/completion/hx.fish stage/share/fish/vendor_completions.d/hx.fish
+          install -Dm644 contrib/completion/hx.zsh stage/share/zsh/site-functions/_hx
+          printf 'version=%s\ncommit=%s\n' "$roll_version" "$GITHUB_SHA" > stage/BUILD-INFO.txt
+          tar -czf "$TARBALL" -C stage .
+          ls -lh "$TARBALL"
+
+      - name: Smoke test staged payload
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf /tmp/hx-smoke
+          mkdir -p /tmp/hx-smoke
+          tar -xzf "$TARBALL" -C /tmp/hx-smoke
+          HELIX_RUNTIME=/tmp/hx-smoke/share/helix/runtime /tmp/hx-smoke/bin/hx --version
+          HELIX_RUNTIME=/tmp/hx-smoke/share/helix/runtime /tmp/hx-smoke/bin/hx --health
+
+      - name: Install nix (verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Publish tarball to rolling release
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Helix fork rolling (linux x86_64)" \
+              --notes "Rolling prebuilt tarball from release_fork. Nix consumers fetch ${NIX_ASSET}." \
+              --target release_fork
+          fi
+          gh release upload "$ROLL_TAG" "$TARBALL" --clobber
+
+      - name: Generate + publish verified .nix and verify nix build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="https://github.com/WantenMN/helix/releases/download/${ROLL_TAG}/${TARBALL}"
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${roll_version}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          "$out/bin/hx" --version
+          "$out/bin/hx" --health
