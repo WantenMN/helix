@@ -65,18 +65,31 @@ jobs:
           upstream=$(grep -oP '^version\s*=\s*"\K[^"]+' Cargo.toml | head -n 1)
           echo "roll_version=${upstream}-${ver_date}-g${short_sha}" >> "$GITHUB_ENV"
 
-      - name: Build release binary
+      - name: Build release binary (+ grammars)
+        # Grammars MUST be bundled: users never fetch locally. helix-term's
+        # build.rs clones grammar sources (languages.toml) and compiles them
+        # into runtime/grammars/*.so in the source tree, which the assemble
+        # step below ships (only `sources/` is dropped). needs_recompile()
+        # makes retries cheap (already-built grammars are skipped), so retry
+        # the whole build against transient grammar-git failures.
         shell: bash --noprofile --norc -eo pipefail {0}
         env:
-          # Grammars (.so) are built by users at runtime via
-          # `hx --grammar fetch/build`, never bundled (same as upstream
-          # release.yml which ships an empty grammars dir). Disabling the
-          # build-time fetch also keeps CI hermetic (no grammar git clones).
-          HELIX_DISABLE_AUTO_GRAMMAR_BUILD: "1"
           # Baked-in fallback so a plain /usr install works with no env vars;
           # the nix drv overrides it via HELIX_RUNTIME anyway.
           HELIX_DEFAULT_RUNTIME: /usr/share/helix/runtime
-        run: cargo build --locked --profile opt
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --locked --profile opt; then
+              break
+            fi
+            echo "cargo build attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "bundled grammar objects: $(ls target/opt/build 2>/dev/null | wc -l) build dirs"
+          echo "grammars compiled: $(ls runtime/grammars/*.so 2>/dev/null | wc -l)"
 
       - name: Assemble FHS stage and pack tarball
         shell: bash --noprofile --norc -eo pipefail {0}
@@ -89,6 +102,13 @@ jobs:
             stage/share/zsh/site-functions
           install -Dm755 target/opt/hx stage/bin/hx
           # Runtime without grammar sources (same as upstream release.yml).
+          # Ship the compiled grammar objects, drop only the git sources
+          # (same split as upstream release.yml). No local `hx --grammar
+          # fetch/build` is ever needed: the .so files travel with the
+          # tarball and are found via HELIX_RUNTIME.
+          so_count=$(ls runtime/grammars/*.so 2>/dev/null | wc -l)
+          echo "shipping $so_count grammar objects"
+          [ "$so_count" -gt 50 ]
           rm -rf runtime/grammars/sources
           cp -r runtime stage/share/helix/runtime
           install -Dm644 contrib/Helix.desktop stage/share/applications/Helix.desktop
