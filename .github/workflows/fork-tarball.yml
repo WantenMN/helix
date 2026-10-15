@@ -68,6 +68,11 @@ jobs:
       - name: Build release binary
         shell: bash --noprofile --norc -eo pipefail {0}
         env:
+          # Grammars (.so) are built by users at runtime via
+          # `hx --grammar fetch/build`, never bundled (same as upstream
+          # release.yml which ships an empty grammars dir). Disabling the
+          # build-time fetch also keeps CI hermetic (no grammar git clones).
+          HELIX_DISABLE_AUTO_GRAMMAR_BUILD: "1"
           # Baked-in fallback so a plain /usr install works with no env vars;
           # the nix drv overrides it via HELIX_RUNTIME anyway.
           HELIX_DEFAULT_RUNTIME: /usr/share/helix/runtime
