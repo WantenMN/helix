@@ -26,9 +26,12 @@ concurrency:
 
 env:
   ROLL_TAG: fork-linux-x86_64
-  TARBALL: helix-linux-x86_64.tar.gz
+  # Fixed-name pointer consumed by dotfiles (overwritten every run).
   NIX_ASSET: helix-fork.nix
+  # Versioned names (accumulate on the release, pruned to newest 10) are
+  # composed in the version step below.
   NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+  KEEP_VERSIONS: "10"
 
 jobs:
   tarball:
@@ -63,7 +66,12 @@ jobs:
           short_sha=$(git rev-parse --short HEAD)
           ver_date=$(date -u +%Y.%m.%d)
           upstream=$(grep -oP '^version\s*=\s*"\K[^"]+' Cargo.toml | head -n 1)
-          echo "roll_version=${upstream}-${ver_date}-g${short_sha}" >> "$GITHUB_ENV"
+          roll_version="${upstream}-${ver_date}-g${short_sha}"
+          echo "roll_version=${roll_version}" >> "$GITHUB_ENV"
+          # Versioned asset names accumulate on the rolling release (old
+          # versions are retained, pruned to newest $KEEP_VERSIONS at the end).
+          echo "TARBALL=helix-${roll_version}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+          echo "NIX_VERSIONED=helix-fork-${roll_version}.nix" >> "$GITHUB_ENV"
 
       - name: Build release binary (+ grammars)
         # Grammars MUST be bundled: users never fetch locally. helix-term's
@@ -161,12 +169,41 @@ jobs:
           fi
           sed -i -E \
             -e "s|version = \".*\";|version = \"${roll_version}\";|" \
+            -e "s|url = \".*\";|url = \"${url}\";|" \
             -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
             "dist/nix/${NIX_ASSET}"
           grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          # Versioned asset (retained) + fixed-name pointer (dotfiles target).
+          cp "dist/nix/${NIX_ASSET}" "dist/nix/${NIX_VERSIONED}"
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_VERSIONED}" --clobber
           gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
           out=$(nix build -L --impure --no-link --print-out-paths --expr \
             "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
           echo "built: $out"
           "$out/bin/hx" --version
           "$out/bin/hx" --health
+
+      - name: Prune old versions (keep newest)
+        # Old versions stay available so stale machines can reinstall the
+        # exact version their dotfiles pin; only versions beyond the newest
+        # $KEEP_VERSIONS are deleted (tarball + its .nix).
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tars=$(gh release view "$ROLL_TAG" --json assets \
+            --jq -r '.assets | sort_by(.createdAt) | reverse | .[].name' \
+            | grep -E '^helix-.*-linux-x86_64\.tar\.gz$' || true)
+          count=$(echo "$tars" | grep -c . || true)
+          count=${count:-0}
+          if [ "$count" -gt "$KEEP_VERSIONS" ]; then
+            echo "$tars" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              ver=$(echo "$t" | sed -E 's/^helix-(.*)-linux-x86_64\.tar\.gz$/\1/')
+              echo "pruning old version: $t"
+              gh release delete-asset "$ROLL_TAG" "$t" -y
+              gh release delete-asset "$ROLL_TAG" "helix-fork-${ver}.nix" -y || true
+            done
+          else
+            echo "keeping all $count version(s)"
+          fi
