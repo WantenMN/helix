@@ -27,6 +27,10 @@ stdenv.mkDerivation rec {
     makeWrapper
   ];
 
+  buildInputs = [
+    stdenv.cc.cc.lib
+  ];
+
   # Tarball top level is bin/ share/ (no usr/ wrapper).
   # Binary is built with HELIX_DEFAULT_RUNTIME=/usr/share/helix/runtime for
   # FHS installs; here we redirect via the HELIX_RUNTIME env var.
